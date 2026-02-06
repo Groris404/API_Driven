@@ -21,9 +21,9 @@ Une fois le localstack tout sera automatisés, executer la commande suivante :
 ```
 make help
 ```
-Vous aurez la totalités des commandes lié au make : 
-Si la lecture n'est pas votre fort executer seulement : 
+Vous aurez la totalités des commandes lié au make !
 
+Si la lecture n'est pas votre fort executer seulement : 
 ```
 make all
 ```
