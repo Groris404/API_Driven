@@ -1,52 +1,63 @@
-# --- CONFIGURATION ---
-# On force les credentials pour que AWS CLI ne râle pas
-export AWS_ACCESS_KEY_ID=test
-export AWS_SECRET_ACCESS_KEY=test
-export AWS_DEFAULT_REGION=us-east-1
-# L'URL externe est récupérée de votre environnement ou définie ici si besoin
-ENDPOINT := $(if $(AWS_END),$(AWS_END),http://localhost:4566)
+import boto3
+import json
+import os
 
-# --- COMMANDES ---
-.PHONY: help deploy test clean check-env
+def lambda_handler(event, context):
+    # --- CONFIGURATION INTELLIGENTE ---
+    # La Lambda cherche l'instance qui porte l'étiquette (Tag) "MyWorker"
+    TARGET_TAG = "MyWorker"
+    
+    # Configuration pour parler à LocalStack depuis l'intérieur du conteneur
+    ls_hostname = os.environ.get('LOCALSTACK_HOSTNAME', 'localstack')
+    endpoint_url = f"http://{ls_hostname}:4566"
+    
+    ec2 = boto3.client('ec2', endpoint_url=endpoint_url, region_name="us-east-1")
 
-help: ## Affiche cette aide
-	@echo "📚 COMMANDES DISPONIBLES :"
-	@echo "  make deploy   : Package la Lambda et déploie l'API Gateway"
-	@echo "  make test     : Teste l'API via curl (Status)"
-	@echo "  make stop     : Envoie l'ordre d'arrêt à l'instance"
-	@echo "  make start    : Envoie l'ordre de démarrage à l'instance"
+    # 1. RECHERCHE DE L'INSTANCE PAR SON NOM
+    try:
+        response = ec2.describe_instances(Filters=[
+            {'Name': 'tag:Name', 'Values': [TARGET_TAG]},
+            {'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopped']}
+        ])
+        
+        reservations = response.get('Reservations', [])
+        if not reservations:
+            return {
+                "statusCode": 404, 
+                "body": json.dumps({"error": f"Instance '{TARGET_TAG}' introuvable. Avez-vous lance 'make infra' ?"})
+            }
+            
+        # On prend la première instance trouvée
+        INSTANCE_ID = reservations[0]['Instances'][0]['InstanceId']
+        
+    except Exception as e:
+        return {"statusCode": 500, "body": json.dumps({"error": f"Erreur EC2: {str(e)} "})}
 
-check-env:
-	@if [ -z "$(AWS_END)" ]; then \
-		echo "⚠️  ATTENTION : La variable AWS_END n'est pas définie."; \
-		echo "👉 Faites : export AWS_END=https://votre-url-codespace..."; \
-		exit 1; \
-	fi
+    # 2. PILOTAGE
+    params = event.get('queryStringParameters') or {}
+    action = params.get('action', 'status')
+    
+    message = ""
+    try:
+        if action == 'start':
+            ec2.start_instances(InstanceIds=[INSTANCE_ID])
+            message = f"Instance {INSTANCE_ID} ({TARGET_TAG}) demarree."
+        elif action == 'stop':
+            ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+            message = f"Instance {INSTANCE_ID} ({TARGET_TAG}) arretee."
+        elif action == 'status':
+            resp = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
+            state = resp['Reservations'][0]['Instances'][0]['State']['Name']
+            message = f"Instance {INSTANCE_ID} ({TARGET_TAG}) est: {state}"
+        else:
+            message = "Action inconnue. Options: ?action=start | stop | status"
 
-deploy: check-env ## Lance le script de déploiement
-	@echo "🚀 Démarrage du déploiement..."
-	@chmod +x deploy.sh
-	@./deploy.sh
-
-test: check-env ## Vérifie le status de l'instance via l'API
-	@echo "🧪 Test de l'API (Status)..."
-	@# On récupère l'ID de l'API dynamiquement
-	@API_ID=$$(aws apigateway get-rest-apis --endpoint-url=$(ENDPOINT) --query 'items[0].id' --output text); \
-	if [ -z "$$API_ID" ] || [ "$$API_ID" = "None" ]; then \
-		echo "❌ Aucune API trouvée via $(ENDPOINT)"; \
-		exit 1; \
-	fi; \
-	echo "   -> Cible API : $$API_ID"; \
-	echo "   -> Résultat :"; \
-	curl -s "http://localhost:4566/restapis/$$API_ID/prod/_user_request_/manage?action=status" | jq . || curl -s "http://localhost:4566/restapis/$$API_ID/prod/_user_request_/manage?action=status"
-	@echo ""
-
-start: check-env ## Démarre l'EC2 via l'API
-	@echo "🟢 Demande de démarrage..."
-	@API_ID=$$(aws apigateway get-rest-apis --endpoint-url=$(ENDPOINT) --query 'items[0].id' --output text); \
-	curl -s "http://localhost:4566/restapis/$$API_ID/prod/_user_request_/manage?action=start"
-
-stop: check-env ## Arrête l'EC2 via l'API
-	@echo "🔴 Demande d'arrêt..."
-	@API_ID=$$(aws apigateway get-rest-apis --endpoint-url=$(ENDPOINT) --query 'items[0].id' --output text); \
-	curl -s "http://localhost:4566/restapis/$$API_ID/prod/_user_request_/manage?action=stop"
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": message})
+        }
+    except Exception as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e)})
+        }
